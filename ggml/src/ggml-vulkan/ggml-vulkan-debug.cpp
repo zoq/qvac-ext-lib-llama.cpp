@@ -54,6 +54,10 @@ size_t vk_output_tensor;
 #include "ggml-impl.h"
 #include <ostream>
 #include <streambuf>
+#include <dlfcn.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 // Experiment diagnostics: the check-results path writes to vk_dbg_err(), which an Android
 // app discards. Forward complete lines to GGML_LOG_ERROR so the consumer's log callback
@@ -67,7 +71,13 @@ struct vk_dbg_logbuf : std::streambuf {
         return c;
     }
     int sync() override { if (!line.empty()) { flush_line(); } return 0; }
-    void flush_line() { GGML_LOG_ERROR("vkcheck: %s\n", line.c_str()); line.clear(); }
+    void flush_line() {
+        GGML_LOG_ERROR("vkcheck: %s\n", line.c_str());
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_ERROR, "ggml-vulkan", "vkcheck: %s", line.c_str());
+#endif
+        line.clear();
+    }
 };
 }
 static std::ostream & vk_dbg_err() {
@@ -82,6 +92,20 @@ static void ggml_vk_dbg_cpu_compute(ggml_cgraph * cgraph) {
     static ggml_backend_t cpu = nullptr;
     if (cpu == nullptr) {
         cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (cpu == nullptr) {
+            // A GGML_BACKEND_DL module built with its own static ggml-base has its own backend
+            // registry, which the host's CPU backend never joined. Load the CPU variants that
+            // sit beside this module into it.
+            Dl_info info{};
+            if (dladdr((void *) &ggml_vk_dbg_cpu_compute, &info) && info.dli_fname) {
+                std::string dir(info.dli_fname);
+                const size_t slash = dir.find_last_of('/');
+                dir = slash == std::string::npos ? "." : dir.substr(0, slash);
+                ggml_backend_load_all_from_path(dir.c_str());
+                cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+                GGML_LOG_INFO("vkcheck: CPU backend from %s: %s\n", dir.c_str(), cpu ? ggml_backend_name(cpu) : "none");
+            }
+        }
         GGML_ASSERT(cpu != nullptr && "check-results needs a registered CPU backend");
     }
     const ggml_status st = ggml_backend_graph_compute(cpu, cgraph);
@@ -1663,10 +1687,17 @@ void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
     const double error = use_nmse ? nmse : avg_err;
     const double max_error = use_nmse ? 5e-4 : 0.01;
     const char * error_name = use_nmse ? "nmse" : "avg_err";
-    GGML_LOG_INFO("vkcheck #%zu %s %s %s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] %s=%g max=%g first_err=(%g vs %g @%d,%d,%d,%d)\n",
-                  (size_t) check_counter, ggml_op_name(tensor->op), tensor->name, ggml_type_name(tensor->type),
-                  tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], error_name, error, max_error,
-                  (double) first_error_result, (double) first_error_correct, first_error[0], first_error[1], first_error[2], first_error[3]);
+    {
+        char line[512];
+        snprintf(line, sizeof(line), "vkcheck #%zu %s %s %s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] %s=%g max=%g first_err=(%g vs %g @%d,%d,%d,%d)",
+                 (size_t) check_counter, ggml_op_name(tensor->op), tensor->name, ggml_type_name(tensor->type),
+                 tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], error_name, error, max_error,
+                 (double) first_error_result, (double) first_error_correct, first_error[0], first_error[1], first_error[2], first_error[3]);
+        GGML_LOG_INFO("%s\n", line);
+#ifdef __ANDROID__
+        __android_log_print(error > max_error ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, "ggml-vulkan", "%s", line);
+#endif
+    }
 
     if (vk_output_tensor > 0 && vk_output_tensor == check_counter) {
         vk_dbg_err() << "TENSOR CHECK: " << error_name << "=" << error << " in " << ggml_op_name(tensor->op) << " (check " << check_counter << ")" << std::endl;
