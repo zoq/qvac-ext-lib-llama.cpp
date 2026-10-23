@@ -20672,8 +20672,12 @@ bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& 
         }
         return true;
     case VK_VENDOR_ID_QUALCOMM:
-        // Only allow Adreno GPUs with hardware matrix cores (Gen 6+).
-        return arch == vk_device_architecture::QUALCOMM_ADRENO;
+        // Experiment: the Adreno 840 (the only Adreno exposing KHR_cooperative_matrix in
+        // the device fleet) computes a wrong forward pass under LoRA finetuning while the
+        // Adreno 830 (no coopmat) and Mali are correct. Keep matrix cores off on Adreno
+        // until the coopmat1 matmul path is validated there.
+        GGML_UNUSED(arch);
+        return false;
     default:
         return true;
     }
