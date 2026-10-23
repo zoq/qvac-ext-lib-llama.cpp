@@ -5918,6 +5918,23 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = 1;
         }
 
+        // Experiment diagnostics: the resolved device capabilities, at INFO so a
+        // consumer's log callback (e.g. logcat through the addon) carries them.
+        GGML_LOG_INFO("ggml_vulkan: caps %s: arch=%d driver_id=%d driver_ver=%u api=%u subgroup=%u ctl=%d[%u..%u] full=%d arith=%d shuffle=%d clustered=%d ballot=%d vote=%d"
+                      " fp16=%d intdot=%d bda=%d uma=%d tiling=%zu coopmat=%d(m%u n%u k%u f16acc=%d f32acc=%d f32_16x16x16=%d int8=%d(m%u n%u k%u)) coopmat2=%d mul_mat_m[f32]=%d mul_mat_s[f32]=%d\n",
+                      device->name.c_str(), (int) device->architecture, (int) device->driver_id,
+                      device->properties.driverVersion, device->properties.apiVersion,
+                      device->subgroup_size, (int) device->subgroup_size_control, device->subgroup_min_size, device->subgroup_max_size,
+                      (int) device->subgroup_require_full_support, (int) device->subgroup_arithmetic, (int) device->subgroup_shuffle,
+                      (int) device->subgroup_clustered, (int) device->subgroup_ballot, (int) device->subgroup_vote,
+                      (int) device->fp16, (int) device->integer_dot_product, (int) device->buffer_device_address, (int) device->uma,
+                      (size_t) device->tiling_threshold,
+                      (int) device->coopmat_support, device->coopmat_m, device->coopmat_n, device->coopmat_k,
+                      (int) device->coopmat_acc_f16_support, (int) device->coopmat_acc_f32_support,
+                      (int) device->coopmat_f32_support_16x16x16_f32acc,
+                      (int) device->coopmat_int_support, device->coopmat_int_m, device->coopmat_int_n, device->coopmat_int_k,
+                      (int) device->coopmat2, (int) device->mul_mat_m[GGML_TYPE_F32], (int) device->mul_mat_s[GGML_TYPE_F32]);
+
         return device;
     }
 
@@ -6161,7 +6178,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
 #endif
 
     std::string device_name = props2.properties.deviceName.data();
-    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | uma: %d | fp16: %s | bf16: %d | fp4: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
+    GGML_LOG_INFO("ggml_vulkan: %zu = %s (%s) | uma: %d | fp16: %s | bf16: %d | fp4: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
               idx, device_name.c_str(), driver_props.driverName.data(), uma, fp16_str, bf16, fp4, subgroup_size,
               props2.properties.limits.maxComputeSharedMemorySize, integer_dot_product, matrix_cores.c_str());
 
