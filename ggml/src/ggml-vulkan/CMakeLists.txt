@@ -139,6 +139,10 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+    if (ANDROID)
+        # __android_log_print for the device-capability line (ggml-vulkan.cpp)
+        target_link_libraries(ggml-vulkan PRIVATE log)
+    endif()
     target_include_directories(ggml-vulkan
         PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR}

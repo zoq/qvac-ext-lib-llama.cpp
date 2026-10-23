@@ -1,4 +1,7 @@
 #include "ggml-vulkan-common.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #ifdef __APPLE__
 #include <pthread.h>
@@ -3891,7 +3894,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ4_0_64][0], "mul_mm_qjl_tbq4_0_64_f32", mul_mm_qjl_tbq4_0_64_f32_len, mul_mm_qjl_tbq4_0_64_f32_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ4_0_64][1], "mul_mm_qjl_tbq4_0_64_f16", mul_mm_qjl_tbq4_0_64_f16_len, mul_mm_qjl_tbq4_0_64_f16_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
 
-    if (device->subgroup_clustered && device->subgroup_require_full_support) {
+    // The subgroup variant reduces with subgroupClusteredMax/Add(…, 8), which the Adreno 840
+    // driver gets wrong (the same clustered-reduction fault the gated_delta_net shaders work
+    // around): every q8_1-quantized activation feeding an MMQ matmul came out garbage, so LoRA
+    // finetuning on the 840 produced a wrong forward pass. The Adreno 830 has no clustered
+    // support and always took the shared-memory variant, which is correct; use it on Adreno.
+    if (device->subgroup_clustered && device->subgroup_require_full_support &&
+        device->vendor_id != VK_VENDOR_ID_QUALCOMM) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
@@ -5920,8 +5929,9 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         // Experiment diagnostics: the resolved device capabilities, at INFO so a
         // consumer's log callback (e.g. logcat through the addon) carries them.
-        GGML_LOG_INFO("ggml_vulkan: caps %s: arch=%d driver_id=%d driver_ver=%u api=%u subgroup=%u ctl=%d[%u..%u] full=%d arith=%d shuffle=%d clustered=%d ballot=%d vote=%d"
-                      " fp16=%d intdot=%d bda=%d uma=%d tiling=%zu coopmat=%d(m%u n%u k%u f16acc=%d f32acc=%d f32_16x16x16=%d int8=%d(m%u n%u k%u)) coopmat2=%d mul_mat_m[f32]=%d mul_mat_s[f32]=%d\n",
+        char caps[1024];
+        snprintf(caps, sizeof(caps), "caps %s: arch=%d driver_id=%d driver_ver=%u api=%u subgroup=%u ctl=%d[%u..%u] full=%d arith=%d shuffle=%d clustered=%d ballot=%d vote=%d"
+                      " fp16=%d intdot=%d bda=%d uma=%d tiling=%zu coopmat=%d(m%u n%u k%u f16acc=%d f32acc=%d f32_16x16x16=%d int8=%d(m%u n%u k%u)) coopmat2=%d mul_mat_m[f32]=%d mul_mat_s[f32]=%d",
                       device->name.c_str(), (int) device->architecture, (int) device->driver_id,
                       device->properties.driverVersion, device->properties.apiVersion,
                       device->subgroup_size, (int) device->subgroup_size_control, device->subgroup_min_size, device->subgroup_max_size,
@@ -5934,6 +5944,12 @@ vk_device ggml_vk_get_device(size_t idx) {
                       (int) device->coopmat_f32_support_16x16x16_f32acc,
                       (int) device->coopmat_int_support, device->coopmat_int_m, device->coopmat_int_n, device->coopmat_int_k,
                       (int) device->coopmat2, (int) device->mul_mat_m[GGML_TYPE_F32], (int) device->mul_mat_s[GGML_TYPE_F32]);
+        GGML_LOG_INFO("ggml_vulkan: %s\n", caps);
+#ifdef __ANDROID__
+        // A dynamically loaded backend module carries its own ggml logger, which the host's
+        // log callback never sees; logcat is the one channel that reaches the device log.
+        __android_log_print(ANDROID_LOG_INFO, "ggml-vulkan", "%s", caps);
+#endif
 
         return device;
     }
