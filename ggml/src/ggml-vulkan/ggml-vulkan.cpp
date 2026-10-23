@@ -16166,6 +16166,10 @@ void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
     VK_LOG_DEBUG("ggml_vk_compute_forward(" << tensor << ", name=" << tensor->name << ", op=" << ggml_op_name(tensor->op) << ", type=" << tensor->type << ", ne0=" << tensor->ne[0] << ", ne1=" << tensor->ne[1] << ", ne2=" << tensor->ne[2] << ", ne3=" << tensor->ne[3] << ", nb0=" << tensor->nb[0] << ", nb1=" << tensor->nb[1] << ", nb2=" << tensor->nb[2] << ", nb3=" << tensor->nb[3] << ", view_src=" << tensor->view_src << ", view_offs=" << tensor->view_offs << ")");
 
     vk_context subctx = ctx->tensor_ctxs[tensor_idx].lock();
+    if (!subctx) {
+        // the node's context was already submitted and released (check-results submits per node)
+        return;
+    }
 
     // Only run if ctx hasn't been submitted yet
     if (!subctx->seqs.empty()) {
@@ -18213,8 +18217,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
             total_flops += node_flops;
 
-            // Flush the current batch before recording a node that would push it over the flop threshold
+            // Flush the current batch before recording a node that would push it over the flop threshold.
+            // Not under GGML_VULKAN_CHECK_RESULTS: build_graph submits every node on its own context
+            // there, so the batch's first node has no live context left to flush.
+#ifdef GGML_VULKAN_CHECK_RESULTS
+            if (false) {
+#else
             if (flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
+#endif
                 vk_context flush_ctx = ggml_vk_get_compute_ctx(ctx);
                 ggml_vk_ctx_end(flush_ctx);
                 flush_ctx->exit_tensor_idx = -1;
