@@ -191,9 +191,12 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_CHECK_RESULTS)
         add_compile_definitions(GGML_VULKAN_CHECK_RESULTS)
-        # the result-checking path computes a CPU reference graph via
-        # ggml_graph_compute_with_ctx(), which is defined in ggml-cpu
-        target_link_libraries(ggml-vulkan PRIVATE ggml-cpu)
+        # The result-checking path computes its CPU reference graph on the
+        # registry's CPU backend; a GGML_BACKEND_DL build loads that backend at
+        # run time (there is no single ggml-cpu target with CPU variants).
+        if (NOT GGML_BACKEND_DL)
+            target_link_libraries(ggml-vulkan PRIVATE ggml-cpu)
+        endif()
     endif()
 
     if (GGML_VULKAN_DEBUG)
