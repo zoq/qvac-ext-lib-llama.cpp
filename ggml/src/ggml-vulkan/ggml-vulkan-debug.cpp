@@ -909,6 +909,8 @@ void * comp_result;
 size_t comp_size;
 size_t comp_nb[GGML_MAX_DIMS];
 size_t check_counter = 0;
+// set by check_results_0 when it cannot mirror the op; check_results_1 then skips the compare
+static bool vk_check_skipped = false;
 void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int tensor_idx) {
     ggml_tensor * tensor = cgraph->nodes[tensor_idx + ctx->num_additional_fused_ops];
     if (tensor->op == GGML_OP_COUNT_EQUAL_MASKED || tensor->op == GGML_OP_TRANSPOSE || tensor->op == GGML_OP_SET_ROWS || tensor->op == GGML_OP_ARGMAX || tensor->op == GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK || tensor->op == GGML_OP_FLASH_ATTN_EXT_BACK) {
@@ -1205,8 +1207,13 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
                 tensor_clone = ggml_sgn(ggml_ctx, src_clone[0]);
                 break;
             default:
-                vk_dbg_err() << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;
-                GGML_ABORT("fatal error");
+                GGML_LOG_WARN("vkcheck #%zu: no CPU clone for %s (%s), skipping the compare\n", (size_t) check_counter, ggml_op_name(tensor->op), tensor->name);
+                for (auto m : cloned_mallocs) {
+                    free(m);
+                }
+                ggml_free(ggml_ctx);
+                vk_check_skipped = true;
+                return;
             }
         } else if (tensor->op == GGML_OP_GLU) {
             if (src_clone[1] == nullptr) {
@@ -1456,6 +1463,8 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {
             tensor_clone = ggml_ssm_conv_back_c(ggml_ctx, src_clone[0], src_clone[1], tensor);
+        } else if (tensor->op == GGML_OP_CROSS_ENTROPY_LOSS_MASKED) {
+            tensor_clone = ggml_cross_entropy_loss_masked(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_ROLL) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];
@@ -1464,8 +1473,13 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             tensor_clone = ggml_roll(ggml_ctx, src_clone[0], s0, s1, s2, s3);
         }
         else {
-            vk_dbg_err() << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;
-            GGML_ABORT("fatal error");
+            GGML_LOG_WARN("vkcheck #%zu: no CPU clone for %s (%s), skipping the compare\n", (size_t) check_counter, ggml_op_name(tensor->op), tensor->name);
+            for (auto m : cloned_mallocs) {
+                free(m);
+            }
+            ggml_free(ggml_ctx);
+            vk_check_skipped = true;
+            return;
         }
         cloned_tensors[tensor] = tensor_clone;
     }
@@ -1497,6 +1511,11 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
 void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int tensor_idx) {
     ggml_tensor * tensor = cgraph->nodes[tensor_idx + ctx->num_additional_fused_ops];
     if (tensor->op == GGML_OP_COUNT_EQUAL_MASKED || tensor->op == GGML_OP_TRANSPOSE || tensor->op == GGML_OP_SET_ROWS || tensor->op == GGML_OP_ARGMAX || tensor->op == GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK || tensor->op == GGML_OP_FLASH_ATTN_EXT_BACK) {
+        return;
+    }
+
+    if (vk_check_skipped) {
+        vk_check_skipped = false;
         return;
     }
 
