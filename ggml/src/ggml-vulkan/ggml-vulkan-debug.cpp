@@ -1,3 +1,4 @@
+#include <cinttypes>
 #include "ggml-vulkan-common.h"
 
 bool vk_memory_logger_enabled = false;
@@ -49,6 +50,43 @@ void vk_memory_logger::log_deallocation(vk_buffer_ref buf_ref) {
 #ifdef GGML_VULKAN_CHECK_RESULTS
 size_t vk_skip_checks;
 size_t vk_output_tensor;
+
+#include "ggml-impl.h"
+#include <ostream>
+#include <streambuf>
+
+// Experiment diagnostics: the check-results path writes to vk_dbg_err(), which an Android
+// app discards. Forward complete lines to GGML_LOG_ERROR so the consumer's log callback
+// (logcat through the addon) carries them.
+namespace {
+struct vk_dbg_logbuf : std::streambuf {
+    std::string line;
+    int overflow(int c) override {
+        if (c == EOF) { return 0; }
+        if (c == '\n') { flush_line(); } else { line.push_back((char) c); }
+        return c;
+    }
+    int sync() override { if (!line.empty()) { flush_line(); } return 0; }
+    void flush_line() { GGML_LOG_ERROR("vkcheck: %s\n", line.c_str()); line.clear(); }
+};
+}
+static std::ostream & vk_dbg_err() {
+    static vk_dbg_logbuf buf;
+    static std::ostream os(&buf);
+    return os;
+}
+
+// The CPU reference graph runs on the registry's CPU backend, which a GGML_BACKEND_DL
+// build loads at run time, instead of linking ggml-cpu into the Vulkan module.
+static void ggml_vk_dbg_cpu_compute(ggml_cgraph * cgraph) {
+    static ggml_backend_t cpu = nullptr;
+    if (cpu == nullptr) {
+        cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        GGML_ASSERT(cpu != nullptr && "check-results needs a registered CPU backend");
+    }
+    const ggml_status st = ggml_backend_graph_compute(cpu, cgraph);
+    GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+}
 
 static void ggml_vk_print_tensor(const ggml_tensor * tensor, const char * name);
 #endif
@@ -229,7 +267,7 @@ void ggml_vk_test_matmul(ggml_backend_vk_context * ctx, size_t m, size_t n, size
     ggml_cgraph * cgraph = ggml_new_graph(ggml_ctx);
     ggml_build_forward_expand(cgraph, tensor_ggml);
 
-    ggml_graph_compute_with_ctx(ggml_ctx, cgraph, 1);
+    ggml_vk_dbg_cpu_compute(cgraph);
 
     ggml_free(ggml_ctx);
 
@@ -253,29 +291,29 @@ void ggml_vk_test_matmul(ggml_backend_vk_context * ctx, size_t m, size_t n, size
 
     double tflops = 2.0*m*n*k*batch*num_it / (time / 1000.0) / (1000.0*1000.0*1000.0*1000.0);
 
-    std::cerr << "TEST " << shname << " m=" << m << " n=" << n << " k=" << k << " batch=" << batch << " split_k=" << split_k << " matmul " << time / num_it << "ms " << tflops << " TFLOPS avg_err=" << avg_err << std::endl;
+    vk_dbg_err() << "TEST " << shname << " m=" << m << " n=" << n << " k=" << k << " batch=" << batch << " split_k=" << split_k << " matmul " << time / num_it << "ms " << tflops << " TFLOPS avg_err=" << avg_err << std::endl;
 
     if (avg_err > 0.1 || std::isnan(avg_err)) {
-        std::cerr << "m = " << first_err_m << " n = " << first_err_n << " b = " << first_err_b << std::endl;
-        std::cerr << "Actual result: " << std::endl << std::endl;
+        vk_dbg_err() << "m = " << first_err_m << " n = " << first_err_n << " b = " << first_err_b << std::endl;
+        vk_dbg_err() << "Actual result: " << std::endl << std::endl;
         ggml_vk_print_matrix_area(d, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
-        std::cerr << "Expected result: " << std::endl << std::endl;
+        vk_dbg_err() << "Expected result: " << std::endl << std::endl;
         ggml_vk_print_matrix_area(d_chk, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
         if (split_k > 1) {
             float * split_k_buf = (float *) malloc(sizeof(float) * d_ne * split_k);
             ggml_vk_buffer_read(ctx->prealloc_split_k, 0, split_k_buf, sizeof(float) * d_ne * split_k);
 
-            std::cerr << "d_buf0: " << std::endl << std::endl;
+            vk_dbg_err() << "d_buf0: " << std::endl << std::endl;
             ggml_vk_print_matrix_area(split_k_buf, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
-            std::cerr << "d_buf1: " << std::endl << std::endl;
+            vk_dbg_err() << "d_buf1: " << std::endl << std::endl;
             ggml_vk_print_matrix_area(split_k_buf + d_ne, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
-            std::cerr << "d_buf2: " << std::endl << std::endl;
+            vk_dbg_err() << "d_buf2: " << std::endl << std::endl;
             ggml_vk_print_matrix_area(split_k_buf + 2 * d_ne, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
-            std::cerr << "d_buf3: " << std::endl << std::endl;
+            vk_dbg_err() << "d_buf3: " << std::endl << std::endl;
             ggml_vk_print_matrix_area(split_k_buf + 3 * d_ne, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
             free(split_k_buf);
@@ -407,19 +445,19 @@ static void ggml_vk_test_dequant(ggml_backend_vk_context * ctx, size_t ne, ggml_
 
     avg_err /= ne;
 
-    std::cerr << "TEST DEQUANT " << ggml_type_name(quant) << " time=" << ms_dequant << "ms avg_err=" << avg_err << std::endl;
+    vk_dbg_err() << "TEST DEQUANT " << ggml_type_name(quant) << " time=" << ms_dequant << "ms avg_err=" << avg_err << std::endl;
 
     if (avg_err > 0.1) {
-        std::cerr << "first_error = " << first_err << std::endl;
-        std::cerr << "Actual result: " << std::endl << std::endl;
+        vk_dbg_err() << "first_error = " << first_err << std::endl;
+        vk_dbg_err() << "Actual result: " << std::endl << std::endl;
         for (int i = std::max(0, first_err - 5); i < std::min((int)ne, first_err + 5); i++) {
-            std::cerr << ggml_fp16_to_fp32(x_chk[i]) << ", ";
+            vk_dbg_err() << ggml_fp16_to_fp32(x_chk[i]) << ", ";
         }
-        std::cerr << std::endl << "Expected result: " << std::endl << std::endl;
+        vk_dbg_err() << std::endl << "Expected result: " << std::endl << std::endl;
         for (int i = std::max(0, first_err - 5); i < std::min((int)ne, first_err + 5); i++) {
-            std::cerr << x_ref[i] << ", ";
+            vk_dbg_err() << x_ref[i] << ", ";
         }
-        std::cerr << std::endl;
+        vk_dbg_err() << std::endl;
     }
 
     ggml_vk_destroy_buffer(x_buf);
@@ -515,21 +553,21 @@ static void ggml_vk_test_dequant(ggml_backend_vk_context * ctx, size_t ne, ggml_
 //         }
 //     }
 //
-//     std::cerr << "TEST QUANTIZE " << ggml_type_name(quant) << " time=" << ms_quant << "ms " << (first_err == -1 ? "CORRECT" : "INCORRECT") << std::endl;
+//     vk_dbg_err() << "TEST QUANTIZE " << ggml_type_name(quant) << " time=" << ms_quant << "ms " << (first_err == -1 ? "CORRECT" : "INCORRECT") << std::endl;
 //
 //     if (first_err != -1) {
-//         std::cerr << "first_error = " << first_err << std::endl;
-//         std::cerr << "Actual result: " << std::endl << std::endl;
+//         vk_dbg_err() << "first_error = " << first_err << std::endl;
+//         vk_dbg_err() << "Actual result: " << std::endl << std::endl;
 //         std::cout << "d=" << ggml_fp16_to_fp32(qx[first_err].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d) << " s=" << ggml_fp16_to_fp32(qx[first_err].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.s) << " ";
 //         for (size_t j = 0; j < 32; j++) {
 //             std::cout << " qs" << j << "=" << (uint32_t)qx[first_err].qs[j] << " ";
 //         }
-//         std::cerr << std::endl << std::endl << "Expected result: " << std::endl << std::endl;
+//         vk_dbg_err() << std::endl << std::endl << "Expected result: " << std::endl << std::endl;
 //         std::cout << "d=" << ggml_fp16_to_fp32(qx_res[first_err].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d) << " s=" << ggml_fp16_to_fp32(qx_res[first_err].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.s) << " ";
 //         for (size_t j = 0; j < 32; j++) {
 //             std::cout << " qs" << j << "=" << (uint32_t)qx_res[first_err].qs[j] << " ";
 //         }
-//         std::cerr << std::endl;
+//         vk_dbg_err() << std::endl;
 //     }
 //
 //     ggml_vk_destroy_buffer(x_buf);
@@ -557,12 +595,12 @@ void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m, size_t
         }
     }
     if (dq_it == ctx->device->pipeline_matmul.end() || dq_it->second.empty()) {
-        std::cerr << "error: no pipeline for ggml_vk_test_dequant_matmul " << ggml_type_name(quant) << std::endl;
+        vk_dbg_err() << "error: no pipeline for ggml_vk_test_dequant_matmul " << ggml_type_name(quant) << std::endl;
         return;
     }
     auto& dq_configs = dq_it->second;
     if (shader_size >= (int)dq_configs.size()) {
-        std::cerr << "error: shader_size " << shader_size << " >= configs.size() " << dq_configs.size() << " for " << ggml_type_name(quant) << std::endl;
+        vk_dbg_err() << "error: shader_size " << shader_size << " >= configs.size() " << dq_configs.size() << " for " << ggml_type_name(quant) << std::endl;
         return;
     }
 
@@ -577,7 +615,7 @@ void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m, size_t
     }
 
     if (p == nullptr) {
-        std::cerr << "error: no pipeline for ggml_vk_test_dequant_matmul " << ggml_type_name(quant) << std::endl;
+        vk_dbg_err() << "error: no pipeline for ggml_vk_test_dequant_matmul " << ggml_type_name(quant) << std::endl;
         return;
     }
 
@@ -686,7 +724,7 @@ void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m, size_t
     ggml_cgraph * cgraph = ggml_new_graph(ggml_ctx);
     ggml_build_forward_expand(cgraph, tensor_ggml);
 
-    ggml_graph_compute_with_ctx(ggml_ctx, cgraph, 1);
+    ggml_vk_dbg_cpu_compute(cgraph);
 
     ggml_free(ggml_ctx);
 
@@ -710,40 +748,40 @@ void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m, size_t
 
     double tflops = 2.0*m*n*k*batch*num_it / (time_ms / 1000.0) / (1000.0*1000.0*1000.0*1000.0);
 
-    std::cerr << "TEST dequant matmul " << shname;
+    vk_dbg_err() << "TEST dequant matmul " << shname;
     if (mmq) {
-        std::cerr << " mmq";
+        vk_dbg_err() << " mmq";
     }
-    std::cerr << " m=" << m << " n=" << n << " k=" << k << " batch=" << batch << " split_k=" << split_k << " matmul " << time_ms / num_it << "ms " << tflops << " TFLOPS avg_err=" << avg_err << std::endl;
+    vk_dbg_err() << " m=" << m << " n=" << n << " k=" << k << " batch=" << batch << " split_k=" << split_k << " matmul " << time_ms / num_it << "ms " << tflops << " TFLOPS avg_err=" << avg_err << std::endl;
 
     if (avg_err > 0.01 || std::isnan(avg_err)) {
-        std::cerr << "m = " << first_err_m << " n = " << first_err_n << " b = " << first_err_b << std::endl;
-        std::cerr << "Actual result: " << std::endl << std::endl;
+        vk_dbg_err() << "m = " << first_err_m << " n = " << first_err_n << " b = " << first_err_b << std::endl;
+        vk_dbg_err() << "Actual result: " << std::endl << std::endl;
         ggml_vk_print_matrix_area(d, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
-        std::cerr << std::endl;
-        std::cerr << "Expected result: " << std::endl << std::endl;
+        vk_dbg_err() << std::endl;
+        vk_dbg_err() << "Expected result: " << std::endl << std::endl;
         ggml_vk_print_matrix_area(d_chk, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
-        std::cerr << "src0: " << std::endl << std::endl;
+        vk_dbg_err() << "src0: " << std::endl << std::endl;
         ggml_vk_print_matrix_area(x, GGML_TYPE_F32, k, m, first_err_m, first_err_n, first_err_b);
-        std::cerr << std::endl;
-        std::cerr << "src1: " << std::endl << std::endl;
+        vk_dbg_err() << std::endl;
+        vk_dbg_err() << "src1: " << std::endl << std::endl;
         ggml_vk_print_matrix_area(y, GGML_TYPE_F32, k, n, first_err_m, first_err_n, first_err_b);
 
         if (split_k > 1) {
             float * split_k_buf = (float *) malloc(sizeof(float) * d_ne * split_k);
             ggml_vk_buffer_read(ctx->prealloc_split_k, 0, split_k_buf, sizeof(float) * d_ne * split_k);
 
-            std::cerr << "d_buf0: " << std::endl << std::endl;
+            vk_dbg_err() << "d_buf0: " << std::endl << std::endl;
             ggml_vk_print_matrix_area(split_k_buf, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
-            std::cerr << "d_buf1: " << std::endl << std::endl;
+            vk_dbg_err() << "d_buf1: " << std::endl << std::endl;
             ggml_vk_print_matrix_area(split_k_buf + d_ne, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
-            std::cerr << "d_buf2: " << std::endl << std::endl;
+            vk_dbg_err() << "d_buf2: " << std::endl << std::endl;
             ggml_vk_print_matrix_area(split_k_buf + 2 * d_ne, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
-            std::cerr << "d_buf3: " << std::endl << std::endl;
+            vk_dbg_err() << "d_buf3: " << std::endl << std::endl;
             ggml_vk_print_matrix_area(split_k_buf + 3 * d_ne, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
 
             free(split_k_buf);
@@ -784,9 +822,9 @@ static void ggml_vk_print_graph_origin(const ggml_tensor * tensor, std::vector<c
         return;
     }
     for (int j = 0; j < level; j++) {
-        std::cerr << " ";
+        vk_dbg_err() << " ";
     }
-    std::cerr << ggml_op_name(tensor->op) << " gpu=" << (tensor->extra != nullptr) << std::endl;
+    vk_dbg_err() << ggml_op_name(tensor->op) << " gpu=" << (tensor->extra != nullptr) << std::endl;
 
     done.push_back(tensor);
 
@@ -848,17 +886,17 @@ static void ggml_vk_print_tensor(const ggml_tensor * tensor, const char * name) 
         ggml_vk_buffer_read(buffer_gpu, vk_tensor_offset(tensor) + tensor->view_offs, tensor_data, tensor_size);
     }
 
-    std::cerr << "TENSOR CHECK " << name << " (" << tensor->name << "): " << ggml_op_name(tensor->op) << std::endl;
-    std::cerr << "tensor=" << tensor << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << std::endl;
+    vk_dbg_err() << "TENSOR CHECK " << name << " (" << tensor->name << "): " << ggml_op_name(tensor->op) << std::endl;
+    vk_dbg_err() << "tensor=" << tensor << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << std::endl;
     if (tensor->src[0] != nullptr) {
-        std::cerr << "tensor->src[0]=" << tensor->src[0] << " name=" << tensor->src[0]->name << " op=" << ggml_op_name(tensor->src[0]->op) << " type=" << ggml_type_name(tensor->src[0]->type) << " ne0=" << tensor->src[0]->ne[0] << " nb0=" << tensor->src[0]->nb[0] << " ne1=" << tensor->src[0]->ne[1] << " nb1=" << tensor->src[0]->nb[1] << " ne2=" << tensor->src[0]->ne[2] << " nb2=" << tensor->src[0]->nb[2] << " ne3=" << tensor->src[0]->ne[3] << " nb3=" << tensor->src[0]->nb[3] << std::endl;
+        vk_dbg_err() << "tensor->src[0]=" << tensor->src[0] << " name=" << tensor->src[0]->name << " op=" << ggml_op_name(tensor->src[0]->op) << " type=" << ggml_type_name(tensor->src[0]->type) << " ne0=" << tensor->src[0]->ne[0] << " nb0=" << tensor->src[0]->nb[0] << " ne1=" << tensor->src[0]->ne[1] << " nb1=" << tensor->src[0]->nb[1] << " ne2=" << tensor->src[0]->ne[2] << " nb2=" << tensor->src[0]->nb[2] << " ne3=" << tensor->src[0]->ne[3] << " nb3=" << tensor->src[0]->nb[3] << std::endl;
     }
     if (tensor->src[1] != nullptr) {
-        std::cerr << "tensor->src[1]=" << tensor->src[1] << " name=" << tensor->src[1]->name << " op=" << ggml_op_name(tensor->src[1]->op) << " type=" << ggml_type_name(tensor->src[1]->type) << " ne0=" << tensor->src[1]->ne[0] << " nb0=" << tensor->src[1]->nb[0] << " ne1=" << tensor->src[1]->ne[1] << " nb1=" << tensor->src[1]->nb[1] << " ne2=" << tensor->src[1]->ne[2] << " nb2=" << tensor->src[1]->nb[2] << " ne3=" << tensor->src[1]->ne[3] << " nb3=" << tensor->src[1]->nb[3] << std::endl;
+        vk_dbg_err() << "tensor->src[1]=" << tensor->src[1] << " name=" << tensor->src[1]->name << " op=" << ggml_op_name(tensor->src[1]->op) << " type=" << ggml_type_name(tensor->src[1]->type) << " ne0=" << tensor->src[1]->ne[0] << " nb0=" << tensor->src[1]->nb[0] << " ne1=" << tensor->src[1]->ne[1] << " nb1=" << tensor->src[1]->nb[1] << " ne2=" << tensor->src[1]->ne[2] << " nb2=" << tensor->src[1]->nb[2] << " ne3=" << tensor->src[1]->ne[3] << " nb3=" << tensor->src[1]->nb[3] << std::endl;
     }
-    std::cerr << std::endl << "Result:" << std::endl;
+    vk_dbg_err() << std::endl << "Result:" << std::endl;
     ggml_vk_print_tensor_area(tensor, tensor_data, 5, 5, 0, 0);
-    std::cerr << std::endl;
+    vk_dbg_err() << std::endl;
     std::vector<const ggml_tensor *> done;
     ggml_vk_print_graph_origin(tensor, done);
 
@@ -1167,7 +1205,7 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
                 tensor_clone = ggml_sgn(ggml_ctx, src_clone[0]);
                 break;
             default:
-                std::cerr << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;
+                vk_dbg_err() << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;
                 GGML_ABORT("fatal error");
             }
         } else if (tensor->op == GGML_OP_GLU) {
@@ -1426,7 +1464,7 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             tensor_clone = ggml_roll(ggml_ctx, src_clone[0], s0, s1, s2, s3);
         }
         else {
-            std::cerr << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;
+            vk_dbg_err() << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;
             GGML_ABORT("fatal error");
         }
         cloned_tensors[tensor] = tensor_clone;
@@ -1435,7 +1473,7 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
     ggml_cgraph * cgraph_cpu = ggml_new_graph(ggml_ctx);
     ggml_build_forward_expand(cgraph_cpu, tensor_clone);
 
-    ggml_graph_compute_with_ctx(ggml_ctx, cgraph_cpu, 8);
+    ggml_vk_dbg_cpu_compute(cgraph_cpu);
 
     if (vk_output_tensor > 0 && vk_output_tensor == check_counter) {
         ggml_vk_print_tensor(tensor_clone, "tensor_clone");
@@ -1544,31 +1582,31 @@ void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
                             GGML_ABORT("Results check not implemented for type %s", ggml_type_name(tensor->type));
                         }
                     } else {
-                        std::cerr << "Missing debug code for type " << ggml_type_name(tensor->type) << std::endl;
+                        vk_dbg_err() << "Missing debug code for type " << ggml_type_name(tensor->type) << std::endl;
                         GGML_ABORT("fatal error");
                     }
 
                     if ((std::isnan(correct) != std::isnan(result)) || (std::isinf(correct) != std::isinf(result)) || !buffer_size_fit) {
-                        std::cerr << "ERROR: Invalid value in " << ggml_op_name(tensor->op) << " i3=" << i3 << " i2=" << i2 << " i1=" << i1 << " i0=" << i0 << " result=" << result << " correct=" << correct << " avg_err=" << (avg_err / counter) << std::endl;
-                        std::cerr << "tensor=" << tensor << " tensor->name=" << tensor->name << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << " offset=" << tensor->view_offs << std::endl;
+                        vk_dbg_err() << "ERROR: Invalid value in " << ggml_op_name(tensor->op) << " i3=" << i3 << " i2=" << i2 << " i1=" << i1 << " i0=" << i0 << " result=" << result << " correct=" << correct << " avg_err=" << (avg_err / counter) << std::endl;
+                        vk_dbg_err() << "tensor=" << tensor << " tensor->name=" << tensor->name << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << " offset=" << tensor->view_offs << std::endl;
                         if (src0 != nullptr) {
-                            std::cerr << "src0=" << src0 << " src0->name=" << src0->name << " op=" << ggml_op_name(src0->op) << " type=" << ggml_type_name(src0->type) << " ne0=" << src0->ne[0] << " nb0=" << src0->nb[0] << " ne1=" << src0->ne[1] << " nb1=" << src0->nb[1] << " ne2=" << src0->ne[2] << " nb2=" << src0->nb[2] << " ne3=" << src0->ne[3] << " nb3=" << src0->nb[3] << " offset=" << src0->view_offs << std::endl;
+                            vk_dbg_err() << "src0=" << src0 << " src0->name=" << src0->name << " op=" << ggml_op_name(src0->op) << " type=" << ggml_type_name(src0->type) << " ne0=" << src0->ne[0] << " nb0=" << src0->nb[0] << " ne1=" << src0->ne[1] << " nb1=" << src0->nb[1] << " ne2=" << src0->ne[2] << " nb2=" << src0->nb[2] << " ne3=" << src0->ne[3] << " nb3=" << src0->nb[3] << " offset=" << src0->view_offs << std::endl;
                         }
                         if (src1 != nullptr) {
-                            std::cerr << "src1=" << src1 << " src1->name=" << src1->name << " op=" << ggml_op_name(src1->op) << " type=" << ggml_type_name(src1->type) << " ne0=" << src1->ne[0] << " nb0=" << src1->nb[0] << " ne1=" << src1->ne[1] << " nb1=" << src1->nb[1] << " ne2=" << src1->ne[2] << " nb2=" << src1->nb[2] << " ne3=" << src1->ne[3] << " nb3=" << src1->nb[3] << " offset=" << src1->view_offs << std::endl;
+                            vk_dbg_err() << "src1=" << src1 << " src1->name=" << src1->name << " op=" << ggml_op_name(src1->op) << " type=" << ggml_type_name(src1->type) << " ne0=" << src1->ne[0] << " nb0=" << src1->nb[0] << " ne1=" << src1->ne[1] << " nb1=" << src1->nb[1] << " ne2=" << src1->ne[2] << " nb2=" << src1->nb[2] << " ne3=" << src1->ne[3] << " nb3=" << src1->nb[3] << " offset=" << src1->view_offs << std::endl;
                         }
                         if (src2 != nullptr) {
-                            std::cerr << "src2=" << src2 << " src2->name=" << src2->name << " op=" << ggml_op_name(src2->op) << " type=" << ggml_type_name(src2->type) << " ne0=" << src2->ne[0] << " nb0=" << src2->nb[0] << " ne1=" << src2->ne[1] << " nb1=" << src2->nb[1] << " ne2=" << src2->ne[2] << " nb2=" << src2->nb[2] << " ne3=" << src2->ne[3] << " nb3=" << src2->nb[3] << " offset=" << src2->view_offs << std::endl;
+                            vk_dbg_err() << "src2=" << src2 << " src2->name=" << src2->name << " op=" << ggml_op_name(src2->op) << " type=" << ggml_type_name(src2->type) << " ne0=" << src2->ne[0] << " nb0=" << src2->nb[0] << " ne1=" << src2->ne[1] << " nb1=" << src2->nb[1] << " ne2=" << src2->ne[2] << " nb2=" << src2->nb[2] << " ne3=" << src2->ne[3] << " nb3=" << src2->nb[3] << " offset=" << src2->view_offs << std::endl;
                         }
                         if (src3 != nullptr) {
-                            std::cerr << "src3=" << src3 << " src3->name=" << src3->name << " op=" << ggml_op_name(src3->op) << " type=" << ggml_type_name(src3->type) << " ne0=" << src3->ne[0] << " nb0=" << src3->nb[0] << " ne1=" << src3->ne[1] << " nb1=" << src3->nb[1] << " ne2=" << src3->ne[2] << " nb2=" << src3->nb[2] << " ne3=" << src3->ne[3] << " nb3=" << src3->nb[3] << " offset=" << src3->view_offs << std::endl;
+                            vk_dbg_err() << "src3=" << src3 << " src3->name=" << src3->name << " op=" << ggml_op_name(src3->op) << " type=" << ggml_type_name(src3->type) << " ne0=" << src3->ne[0] << " nb0=" << src3->nb[0] << " ne1=" << src3->ne[1] << " nb1=" << src3->nb[1] << " ne2=" << src3->ne[2] << " nb2=" << src3->nb[2] << " ne3=" << src3->ne[3] << " nb3=" << src3->nb[3] << " offset=" << src3->view_offs << std::endl;
                         }
-                        std::cerr << "First error: result=" << first_error_result << " correct=" << first_error_correct  << " i3=" << first_error[3] << " i2=" << first_error[2] << " i1=" << first_error[1] << " i0=" << first_error[0] << std::endl;
-                        std::cerr << std::endl << "Result:" << std::endl;
+                        vk_dbg_err() << "First error: result=" << first_error_result << " correct=" << first_error_correct  << " i3=" << first_error[3] << " i2=" << first_error[2] << " i1=" << first_error[1] << " i0=" << first_error[0] << std::endl;
+                        vk_dbg_err() << std::endl << "Result:" << std::endl;
                         ggml_vk_print_tensor_area(tensor, tensor_data, i0, i1, i2, i3);
-                        std::cerr << std::endl << "Correct:" << std::endl;
+                        vk_dbg_err() << std::endl << "Correct:" << std::endl;
                         ggml_vk_print_tensor_area(tensor, comp_result, i0, i1, i2, i3);
-                        std::cerr << std::endl;
+                        vk_dbg_err() << std::endl;
                         std::vector<const ggml_tensor *> done;
                         ggml_vk_print_graph_origin(tensor, done);
                         GGML_ABORT("fatal error");
@@ -1606,58 +1644,62 @@ void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
     const double error = use_nmse ? nmse : avg_err;
     const double max_error = use_nmse ? 5e-4 : 0.01;
     const char * error_name = use_nmse ? "nmse" : "avg_err";
+    GGML_LOG_INFO("vkcheck #%zu %s %s %s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] %s=%g max=%g first_err=(%g vs %g @%d,%d,%d,%d)\n",
+                  (size_t) check_counter, ggml_op_name(tensor->op), tensor->name, ggml_type_name(tensor->type),
+                  tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], error_name, error, max_error,
+                  (double) first_error_result, (double) first_error_correct, first_error[0], first_error[1], first_error[2], first_error[3]);
 
     if (vk_output_tensor > 0 && vk_output_tensor == check_counter) {
-        std::cerr << "TENSOR CHECK: " << error_name << "=" << error << " in " << ggml_op_name(tensor->op) << " (check " << check_counter << ")" << std::endl;
-        std::cerr << "tensor=" << tensor << " tensor->name=" << tensor->name << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << " offset=" << tensor->view_offs << std::endl;
+        vk_dbg_err() << "TENSOR CHECK: " << error_name << "=" << error << " in " << ggml_op_name(tensor->op) << " (check " << check_counter << ")" << std::endl;
+        vk_dbg_err() << "tensor=" << tensor << " tensor->name=" << tensor->name << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << " offset=" << tensor->view_offs << std::endl;
         if (src0 != nullptr) {
-            std::cerr << "src0=" << src0 << " op=" << ggml_op_name(src0->op) << " type=" << ggml_type_name(src0->type) << " ne0=" << src0->ne[0] << " nb0=" << src0->nb[0] << " ne1=" << src0->ne[1] << " nb1=" << src0->nb[1] << " ne2=" << src0->ne[2] << " nb2=" << src0->nb[2] << " ne3=" << src0->ne[3] << " nb3=" << src0->nb[3] << " offset=" << src0->view_offs << std::endl;
+            vk_dbg_err() << "src0=" << src0 << " op=" << ggml_op_name(src0->op) << " type=" << ggml_type_name(src0->type) << " ne0=" << src0->ne[0] << " nb0=" << src0->nb[0] << " ne1=" << src0->ne[1] << " nb1=" << src0->nb[1] << " ne2=" << src0->ne[2] << " nb2=" << src0->nb[2] << " ne3=" << src0->ne[3] << " nb3=" << src0->nb[3] << " offset=" << src0->view_offs << std::endl;
         }
         if (src1 != nullptr) {
-            std::cerr << "src1=" << src1 << " op=" << ggml_op_name(src1->op) << " type=" << ggml_type_name(src1->type) << " ne0=" << src1->ne[0] << " nb0=" << src1->nb[0] << " ne1=" << src1->ne[1] << " nb1=" << src1->nb[1] << " ne2=" << src1->ne[2] << " nb2=" << src1->nb[2] << " ne3=" << src1->ne[3] << " nb3=" << src1->nb[3] << " offset=" << src1->view_offs << std::endl;
+            vk_dbg_err() << "src1=" << src1 << " op=" << ggml_op_name(src1->op) << " type=" << ggml_type_name(src1->type) << " ne0=" << src1->ne[0] << " nb0=" << src1->nb[0] << " ne1=" << src1->ne[1] << " nb1=" << src1->nb[1] << " ne2=" << src1->ne[2] << " nb2=" << src1->nb[2] << " ne3=" << src1->ne[3] << " nb3=" << src1->nb[3] << " offset=" << src1->view_offs << std::endl;
         }
         if (src2 != nullptr) {
-            std::cerr << "src2=" << src2 << " op=" << ggml_op_name(src2->op) << " type=" << ggml_type_name(src2->type) << " ne0=" << src2->ne[0] << " nb0=" << src2->nb[0] << " ne1=" << src2->ne[1] << " nb1=" << src2->nb[1] << " ne2=" << src2->ne[2] << " nb2=" << src2->nb[2] << " ne3=" << src2->ne[3] << " nb3=" << src2->nb[3] << " offset=" << src2->view_offs << std::endl;
+            vk_dbg_err() << "src2=" << src2 << " op=" << ggml_op_name(src2->op) << " type=" << ggml_type_name(src2->type) << " ne0=" << src2->ne[0] << " nb0=" << src2->nb[0] << " ne1=" << src2->ne[1] << " nb1=" << src2->nb[1] << " ne2=" << src2->ne[2] << " nb2=" << src2->nb[2] << " ne3=" << src2->ne[3] << " nb3=" << src2->nb[3] << " offset=" << src2->view_offs << std::endl;
         }
         if (src3 != nullptr) {
-            std::cerr << "src3=" << src3 << " op=" << ggml_op_name(src3->op) << " type=" << ggml_type_name(src3->type) << " ne0=" << src3->ne[0] << " nb0=" << src3->nb[0] << " ne1=" << src3->ne[1] << " nb1=" << src3->nb[1] << " ne2=" << src3->ne[2] << " nb2=" << src3->nb[2] << " ne3=" << src3->ne[3] << " nb3=" << src3->nb[3] << " offset=" << src3->view_offs << std::endl;
+            vk_dbg_err() << "src3=" << src3 << " op=" << ggml_op_name(src3->op) << " type=" << ggml_type_name(src3->type) << " ne0=" << src3->ne[0] << " nb0=" << src3->nb[0] << " ne1=" << src3->ne[1] << " nb1=" << src3->nb[1] << " ne2=" << src3->ne[2] << " nb2=" << src3->nb[2] << " ne3=" << src3->ne[3] << " nb3=" << src3->nb[3] << " offset=" << src3->view_offs << std::endl;
         }
-        std::cerr << "First error: result=" << first_error_result << " correct=" << first_error_correct  << " i3=" << first_error[3] << " i2=" << first_error[2] << " i1=" << first_error[1] << " i0=" << first_error[0] << std::endl;
-        std::cerr << std::endl << "Result:" << std::endl;
+        vk_dbg_err() << "First error: result=" << first_error_result << " correct=" << first_error_correct  << " i3=" << first_error[3] << " i2=" << first_error[2] << " i1=" << first_error[1] << " i0=" << first_error[0] << std::endl;
+        vk_dbg_err() << std::endl << "Result:" << std::endl;
         ggml_vk_print_tensor_area(tensor, tensor_data, 5, 5, 0, 0);
-        std::cerr << std::endl << "Correct:" << std::endl;
+        vk_dbg_err() << std::endl << "Correct:" << std::endl;
         ggml_vk_print_tensor_area(tensor, comp_result, 5, 5, 0, 0);
-        std::cerr << std::endl;
+        vk_dbg_err() << std::endl;
         std::vector<const ggml_tensor *> done;
         ggml_vk_print_graph_origin(tensor, done);
     }
 
     if (error > max_error || std::isnan(error)) {
-        std::cerr << "ERROR: " << error_name << "=" << error << " in " << ggml_op_name(tensor->op) << " (check " << check_counter << ")" << std::endl;
-        std::cerr << "tensor=" << tensor << " tensor->name=" << tensor->name << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << " offset=" << tensor->view_offs << std::endl;
+        vk_dbg_err() << "ERROR: " << error_name << "=" << error << " in " << ggml_op_name(tensor->op) << " (check " << check_counter << ")" << std::endl;
+        vk_dbg_err() << "tensor=" << tensor << " tensor->name=" << tensor->name << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << " offset=" << tensor->view_offs << std::endl;
         if (src0 != nullptr) {
-            std::cerr << "src0=" << src0 << " op=" << ggml_op_name(src0->op) << " type=" << ggml_type_name(src0->type) << " ne0=" << src0->ne[0] << " nb0=" << src0->nb[0] << " ne1=" << src0->ne[1] << " nb1=" << src0->nb[1] << " ne2=" << src0->ne[2] << " nb2=" << src0->nb[2] << " ne3=" << src0->ne[3] << " nb3=" << src0->nb[3] << " offset=" << src0->view_offs << std::endl;
+            vk_dbg_err() << "src0=" << src0 << " op=" << ggml_op_name(src0->op) << " type=" << ggml_type_name(src0->type) << " ne0=" << src0->ne[0] << " nb0=" << src0->nb[0] << " ne1=" << src0->ne[1] << " nb1=" << src0->nb[1] << " ne2=" << src0->ne[2] << " nb2=" << src0->nb[2] << " ne3=" << src0->ne[3] << " nb3=" << src0->nb[3] << " offset=" << src0->view_offs << std::endl;
         }
         if (src1 != nullptr) {
-            std::cerr << "src1=" << src1 << " op=" << ggml_op_name(src1->op) << " type=" << ggml_type_name(src1->type) << " ne0=" << src1->ne[0] << " nb0=" << src1->nb[0] << " ne1=" << src1->ne[1] << " nb1=" << src1->nb[1] << " ne2=" << src1->ne[2] << " nb2=" << src1->nb[2] << " ne3=" << src1->ne[3] << " nb3=" << src1->nb[3] << " offset=" << src1->view_offs << std::endl;
+            vk_dbg_err() << "src1=" << src1 << " op=" << ggml_op_name(src1->op) << " type=" << ggml_type_name(src1->type) << " ne0=" << src1->ne[0] << " nb0=" << src1->nb[0] << " ne1=" << src1->ne[1] << " nb1=" << src1->nb[1] << " ne2=" << src1->ne[2] << " nb2=" << src1->nb[2] << " ne3=" << src1->ne[3] << " nb3=" << src1->nb[3] << " offset=" << src1->view_offs << std::endl;
         }
         if (src2 != nullptr) {
-            std::cerr << "src2=" << src2 << " op=" << ggml_op_name(src2->op) << " type=" << ggml_type_name(src2->type) << " ne0=" << src2->ne[0] << " nb0=" << src2->nb[0] << " ne1=" << src2->ne[1] << " nb1=" << src2->nb[1] << " ne2=" << src2->ne[2] << " nb2=" << src2->nb[2] << " ne3=" << src2->ne[3] << " nb3=" << src2->nb[3] << " offset=" << src2->view_offs << std::endl;
+            vk_dbg_err() << "src2=" << src2 << " op=" << ggml_op_name(src2->op) << " type=" << ggml_type_name(src2->type) << " ne0=" << src2->ne[0] << " nb0=" << src2->nb[0] << " ne1=" << src2->ne[1] << " nb1=" << src2->nb[1] << " ne2=" << src2->ne[2] << " nb2=" << src2->nb[2] << " ne3=" << src2->ne[3] << " nb3=" << src2->nb[3] << " offset=" << src2->view_offs << std::endl;
         }
         if (src3 != nullptr) {
-            std::cerr << "src3=" << src3 << " op=" << ggml_op_name(src3->op) << " type=" << ggml_type_name(src3->type) << " ne0=" << src3->ne[0] << " nb0=" << src3->nb[0] << " ne1=" << src3->ne[1] << " nb1=" << src3->nb[1] << " ne2=" << src3->ne[2] << " nb2=" << src3->nb[2] << " ne3=" << src3->ne[3] << " nb3=" << src3->nb[3] << " offset=" << src3->view_offs << std::endl;
+            vk_dbg_err() << "src3=" << src3 << " op=" << ggml_op_name(src3->op) << " type=" << ggml_type_name(src3->type) << " ne0=" << src3->ne[0] << " nb0=" << src3->nb[0] << " ne1=" << src3->ne[1] << " nb1=" << src3->nb[1] << " ne2=" << src3->ne[2] << " nb2=" << src3->nb[2] << " ne3=" << src3->ne[3] << " nb3=" << src3->nb[3] << " offset=" << src3->view_offs << std::endl;
         }
-        std::cerr << "First error: result=" << first_error_result << " correct=" << first_error_correct  << " i3=" << first_error[3] << " i2=" << first_error[2] << " i1=" << first_error[1] << " i0=" << first_error[0] << std::endl;
-        std::cerr << std::endl << "Result:" << std::endl;
+        vk_dbg_err() << "First error: result=" << first_error_result << " correct=" << first_error_correct  << " i3=" << first_error[3] << " i2=" << first_error[2] << " i1=" << first_error[1] << " i0=" << first_error[0] << std::endl;
+        vk_dbg_err() << std::endl << "Result:" << std::endl;
         ggml_vk_print_tensor_area(tensor, tensor_data, first_error[0], first_error[1], first_error[2], first_error[3]);
-        std::cerr << std::endl << "Correct:" << std::endl;
+        vk_dbg_err() << std::endl << "Correct:" << std::endl;
         ggml_vk_print_tensor_area(tensor, comp_result, first_error[0], first_error[1], first_error[2], first_error[3]);
-        std::cerr << std::endl;
+        vk_dbg_err() << std::endl;
         std::vector<const ggml_tensor *> done;
         ggml_vk_print_graph_origin(tensor, done);
         GGML_ABORT("fatal error");
     } else {
-        std::cerr << check_counter << " " << tensor->name << " op=" << ggml_op_name(tensor->op) << " " << error_name << "=" << error << std::endl;
+        vk_dbg_err() << check_counter << " " << tensor->name << " op=" << ggml_op_name(tensor->op) << " " << error_name << "=" << error << std::endl;
     }
 
     free(comp_result);
